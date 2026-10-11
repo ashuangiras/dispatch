@@ -162,6 +162,7 @@ type run struct {
 	pgid     int
 	reason   string
 	grace    time.Duration
+	started  chan struct{} // closed once pgid is valid, or once launch has failed
 	exited   chan struct{}
 	done     chan struct{}
 	lock     *os.File
@@ -205,18 +206,32 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 	}
 
 	id := newID()
-	r := &run{m: m, dir: filepath.Join(m.runsDir, id), grace: grace, exited: make(chan struct{}), done: make(chan struct{})}
+	r := &run{
+		m: m, dir: filepath.Join(m.runsDir, id), grace: grace,
+		started: make(chan struct{}), exited: make(chan struct{}), done: make(chan struct{}),
+	}
 
-	// Initialize critical fields before publishing to m.active to prevent races.
-	// Create directory first.
+	// published becomes true only once r is visible in m.active with every
+	// field snapshot() and terminate() read already initialized. Until then,
+	// this defer owns every cleanup path, so a rejected or failed admission
+	// never leaves behind a bare run directory, an open lock or a reserved
+	// active-count slot (it previously did: r.lock being non-nil after a
+	// successful lockOwner skipped the old nil-check cleanup on every later
+	// failure, including plain admission rejection).
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		if r.lock != nil {
+			_ = r.lock.Close()
+		}
+		_ = os.RemoveAll(r.dir)
+	}()
+
 	if err := os.Mkdir(r.dir, 0o700); err != nil {
 		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
-	defer func() {
-		if r.lock == nil {
-			_ = os.RemoveAll(r.dir)
-		}
-	}()
 
 	// Lock the run directory.
 	var err error
@@ -235,7 +250,6 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 
 	// Initialize capture.Writer before publishing.
 	if r.cw, err = capture.NewWriter(r.dir, maxOut, nil); err != nil {
-		_ = r.lock.Close()
 		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
 
@@ -243,20 +257,20 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 	m.mu.Lock()
 	if m.closing {
 		m.mu.Unlock()
-		_ = r.lock.Close()
 		return Snapshot{}, ErrShuttingDown
 	}
 	if len(m.active) >= m.cfg.MaxActive {
 		m.mu.Unlock()
-		_ = r.lock.Close()
 		return Snapshot{}, fmt.Errorf("%w: %d runs are active, the limit is %d; wait for or cancel one", ErrTooManyActive, len(m.active), m.cfg.MaxActive)
 	}
 	m.active[id] = r
 	m.wg.Add(1)
 	m.mu.Unlock()
+	published = true
 
 	// Define abandon function for use after m.active publication.
 	abandon := func(err error) (Snapshot, error) {
+		close(r.started)
 		_ = r.lock.Close()
 		_ = os.RemoveAll(r.dir)
 		m.mu.Lock()
@@ -279,6 +293,7 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 		r.rec.EndedAt = &now
 		r.rec.Capture = &st
 		r.mu.Unlock()
+		close(r.started)
 		close(r.exited)
 		r.finish()
 	}
@@ -290,13 +305,17 @@ func (r *run) launch(req StartRequest) error {
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
 	r.rec.Cwd = cwd
+	r.mu.Unlock()
 	env := req.Env.build(r.m.cfg.Environ())
 	exe, err := resolveExecutable(req.Command, cwd, env)
 	if err != nil {
 		return err
 	}
+	r.mu.Lock()
 	r.rec.Executable = exe
+	r.mu.Unlock()
 	var rEnds, wEnds [2]*os.File
 	for i := range rEnds {
 		if rEnds[i], wEnds[i], err = os.Pipe(); err != nil {
@@ -334,6 +353,8 @@ func (r *run) launch(req StartRequest) error {
 	r.readEnds = rEnds
 	rec := r.rec
 	r.mu.Unlock()
+	// From here on r.pgid is valid and never changes again: safe to signal it.
+	close(r.started)
 	if err := writeRecord(r.dir, rec); err != nil {
 		r.m.cfg.Logger.Error("persisting run record", "run", rec.ID, "err", err)
 	}
@@ -451,8 +472,24 @@ func (r *run) terminate(reason string, grace time.Duration) {
 	if r.reason == "" {
 		r.reason = reason
 	}
+	r.mu.Unlock()
+	// The run may still be inside Start()/launch(), before a process (and so a
+	// process-group ID) exists. Wait for whichever of launch()'s two outcomes
+	// comes first instead of reading pgid now: its zero value is not a process
+	// group, and signaling it would reach this server's own process group
+	// (kill(2) treats pgid 0 as "the caller's"), not the run's.
+	select {
+	case <-r.started:
+	case <-r.exited:
+		return
+	}
+	r.mu.Lock()
 	pgid := r.pgid
 	r.mu.Unlock()
+	if pgid <= 0 {
+		// launch failed before starting a process: nothing to signal.
+		return
+	}
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	t := time.NewTimer(grace)
 	defer t.Stop()
@@ -568,7 +605,6 @@ func foreignSnapshot(rec Record, dir string) Snapshot {
 	// For foreign instances, we can read what's visible in capture files
 	// (bytes and lines) but cannot determine lost bytes or whether the limit was
 	// reached, as those are only tracked by the owning instance's Writer.
-	// Set Failure to explicitly mark that capture stats are incomplete.
 	if rd, err := capture.OpenReader(dir, true); err == nil {
 		if c, err := rd.Counts(); err == nil {
 			s.Capture.Bytes = c.Bytes
@@ -584,7 +620,12 @@ func foreignSnapshot(rec Record, dir string) Snapshot {
 	if rec.Capture != nil {
 		s.Capture.MaxBytes = rec.Capture.MaxBytes
 	}
-	s.Capture.Failure = fmt.Sprintf("capture stats are incomplete: this run is owned by instance %s (pid %d), not the querying instance; lost_bytes and limit_reached fields are unavailable", rec.Owner.Instance, rec.Owner.PID)
+	// lost_bytes and limit_reached are tracked only by the owning instance's
+	// in-memory Writer: mark them explicitly unknown rather than asserting
+	// zero/false, which would look like "nothing was lost" when the truth is
+	// simply not visible from here. This is distinct from an actual capture
+	// failure (Failure stays empty unless something genuinely went wrong).
+	s.Capture.StatsUnknown = true
 	return s
 }
 
