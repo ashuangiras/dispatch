@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"time"
 
 	"github.com/ashuangiras/dispatch/internal/capture"
@@ -114,8 +115,12 @@ func outputStatus(s runs.Snapshot) OutputStatus {
 }
 
 func runStatus(s runs.Snapshot) RunStatus {
+	label := s.Label
+	if len(label) > labelPreviewBytes {
+		label = strings.ToValidUTF8(label[:labelPreviewBytes], "") + "…"
+	}
 	st := RunStatus{
-		RunID: s.ID, State: string(s.State), Label: s.Label, Command: s.Command, Executable: s.Executable,
+		RunID: s.ID, State: string(s.State), Label: label, Command: s.Command, Executable: s.Executable,
 		Args: s.Args, Cwd: s.Cwd, Env: s.Env, PID: s.PID,
 		CreatedAt: ts(&s.CreatedAt), StartedAt: ts(s.StartedAt), EndedAt: ts(s.EndedAt),
 		ExitCode: s.ExitCode, Signal: s.Signal, Termination: s.Termination, Error: s.Error,

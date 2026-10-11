@@ -206,37 +206,25 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 
 	id := newID()
 	r := &run{m: m, dir: filepath.Join(m.runsDir, id), grace: grace, exited: make(chan struct{}), done: make(chan struct{})}
-	m.mu.Lock()
-	if m.closing {
-		m.mu.Unlock()
-		return Snapshot{}, ErrShuttingDown
-	}
-	if len(m.active) >= m.cfg.MaxActive {
-		m.mu.Unlock()
-		return Snapshot{}, fmt.Errorf("%w: %d runs are active, the limit is %d; wait for or cancel one", ErrTooManyActive, len(m.active), m.cfg.MaxActive)
-	}
-	m.active[id] = r
-	m.wg.Add(1)
-	m.mu.Unlock()
 
-	abandon := func(err error) (Snapshot, error) {
-		if r.lock != nil {
-			_ = r.lock.Close()
-		}
-		_ = os.RemoveAll(r.dir)
-		m.mu.Lock()
-		delete(m.active, id)
-		m.mu.Unlock()
-		m.wg.Done()
+	// Initialize critical fields before publishing to m.active to prevent races.
+	// Create directory first.
+	if err := os.Mkdir(r.dir, 0o700); err != nil {
 		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
-	if err := os.Mkdir(r.dir, 0o700); err != nil {
-		return abandon(err)
-	}
+	defer func() {
+		if r.lock == nil {
+			_ = os.RemoveAll(r.dir)
+		}
+	}()
+
+	// Lock the run directory.
 	var err error
 	if r.lock, err = lockOwner(r.dir, true); err != nil {
-		return abandon(err)
+		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
+
+	// Initialize Record before capture.Writer to ensure consistent state.
 	args := append([]string{}, req.Args...)
 	r.rec = Record{
 		ID: id, Label: req.Label, Command: req.Command, Args: args, Cwd: req.Cwd,
@@ -244,8 +232,38 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 		TimeoutSeconds: req.Timeout.Seconds(), KillGraceSeconds: grace.Seconds(),
 		Owner: Owner{PID: os.Getpid(), Instance: m.instance},
 	}
+
+	// Initialize capture.Writer before publishing.
 	if r.cw, err = capture.NewWriter(r.dir, maxOut, nil); err != nil {
-		return abandon(err)
+		_ = r.lock.Close()
+		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
+	}
+
+	// Now that critical fields are initialized, check if we can add to m.active.
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		_ = r.lock.Close()
+		return Snapshot{}, ErrShuttingDown
+	}
+	if len(m.active) >= m.cfg.MaxActive {
+		m.mu.Unlock()
+		_ = r.lock.Close()
+		return Snapshot{}, fmt.Errorf("%w: %d runs are active, the limit is %d; wait for or cancel one", ErrTooManyActive, len(m.active), m.cfg.MaxActive)
+	}
+	m.active[id] = r
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	// Define abandon function for use after m.active publication.
+	abandon := func(err error) (Snapshot, error) {
+		_ = r.lock.Close()
+		_ = os.RemoveAll(r.dir)
+		m.mu.Lock()
+		delete(m.active, id)
+		m.mu.Unlock()
+		m.wg.Done()
+		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
 	if err := writeRecord(r.dir, r.rec); err != nil {
 		return abandon(err)
@@ -547,7 +565,10 @@ func finishedSnapshot(rec Record, dir string) Snapshot {
 
 func foreignSnapshot(rec Record, dir string) Snapshot {
 	s := Snapshot{Record: rec, Dir: dir, OwnedElsewhere: true}
-	s.Capture.Active = true
+	// For foreign instances, we can read what's visible in capture files
+	// (bytes and lines) but cannot determine lost bytes or whether the limit was
+	// reached, as those are only tracked by the owning instance's Writer.
+	// Set Failure to explicitly mark that capture stats are incomplete.
 	if rd, err := capture.OpenReader(dir, true); err == nil {
 		if c, err := rd.Counts(); err == nil {
 			s.Capture.Bytes = c.Bytes
@@ -556,6 +577,14 @@ func foreignSnapshot(rec Record, dir string) Snapshot {
 		}
 		rd.Close()
 	}
+	// Set Active=true if the run is still running; the owning instance will report
+	// actual lost_bytes and limit_reached. For finished runs, Active=false.
+	s.Capture.Active = rec.State == StateRunning
+	// Copy MaxBytes from the record if available
+	if rec.Capture != nil {
+		s.Capture.MaxBytes = rec.Capture.MaxBytes
+	}
+	s.Capture.Failure = fmt.Sprintf("capture stats are incomplete: this run is owned by instance %s (pid %d), not the querying instance; lost_bytes and limit_reached fields are unavailable", rec.Owner.Instance, rec.Owner.PID)
 	return s
 }
 

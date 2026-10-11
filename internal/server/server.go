@@ -40,6 +40,7 @@ const (
 	maxDeleteIDs         = 100
 	lineOverhead         = 32
 	argsPreviewBytes     = 200
+	labelPreviewBytes    = 200
 	defaultRunTailLines  = 10
 	defaultStatusTailLen = 0
 )
@@ -489,6 +490,7 @@ func readBytes(rd *capture.Reader, res ReadResult, s capture.Stream, off int64, 
 		res.Data = &str
 	default:
 		enc = "text"
+		originalLen := len(data)
 		if off+int64(len(data)) < size {
 			// Do not split a UTF-8 sequence at the end of a chunk.
 			for i := 1; i <= 3 && i <= len(data); i++ {
@@ -500,12 +502,21 @@ func readBytes(rd *capture.Reader, res ReadResult, s capture.Stream, off int64, 
 				}
 			}
 		}
-		str := string(data)
-		if !utf8.Valid(data) {
-			str = strings.ToValidUTF8(str, "\uFFFD")
-			res.InvalidUTF8 = true
+		// If we would return empty data due to UTF-8 truncation, fall back to base64
+		// to ensure progress. This prevents infinite loops when max_bytes is very small.
+		if len(data) == 0 && originalLen > 0 {
+			enc = "base64"
+			data, _, _ = rd.ReadBytes(s, off, maxBytes)
+			str := base64.StdEncoding.EncodeToString(data)
+			res.Data = &str
+		} else {
+			str := string(data)
+			if !utf8.Valid(data) {
+				str = strings.ToValidUTF8(str, "\uFFFD")
+				res.InvalidUTF8 = true
+			}
+			res.Data = &str
 		}
-		res.Data = &str
 	}
 	next := off + int64(len(data))
 	res.Encoding = enc
@@ -668,7 +679,9 @@ func (s *Server) searchOutput(ctx context.Context, _ *mcp.CallToolRequest, in Se
 			cost += len(ol.Text) + lineOverhead
 			g.Lines = append(g.Lines, ol)
 		}
-		if len(res.Groups) > 0 && cost > budget {
+		// Check budget for all groups, including the first.
+		// If a group exceeds the budget, mark truncated and stop.
+		if cost > budget {
 			res.ResponseTruncated = true
 			res.ScanComplete = false
 			next = matches[i]
@@ -759,8 +772,12 @@ func (s *Server) listRuns(_ context.Context, _ *mcp.CallToolRequest, in ListInpu
 		if len(cl) > argsPreviewBytes {
 			cl = strings.ToValidUTF8(cl[:argsPreviewBytes], "") + "…"
 		}
+		label := r.Label
+		if len(label) > labelPreviewBytes {
+			label = strings.ToValidUTF8(label[:labelPreviewBytes], "") + "…"
+		}
 		res.Runs = append(res.Runs, RunSummary{
-			RunID: r.ID, State: string(r.State), Label: r.Label, CommandLine: cl,
+			RunID: r.ID, State: string(r.State), Label: label, CommandLine: cl,
 			CreatedAt: ts(&r.CreatedAt), EndedAt: ts(r.EndedAt), ExitCode: r.ExitCode, Signal: r.Signal,
 			Termination: r.Termination, StoredBytes: r.Capture.StoredBytes, LostBytes: r.Capture.Lost(),
 		})
