@@ -40,6 +40,7 @@ const (
 	maxDeleteIDs         = 100
 	lineOverhead         = 32
 	argsPreviewBytes     = 200
+	labelPreviewBytes    = 200
 	defaultRunTailLines  = 10
 	defaultStatusTailLen = 0
 )
@@ -771,8 +772,12 @@ func (s *Server) listRuns(_ context.Context, _ *mcp.CallToolRequest, in ListInpu
 		if len(cl) > argsPreviewBytes {
 			cl = strings.ToValidUTF8(cl[:argsPreviewBytes], "") + "…"
 		}
+		label := r.Label
+		if len(label) > labelPreviewBytes {
+			label = strings.ToValidUTF8(label[:labelPreviewBytes], "") + "…"
+		}
 		res.Runs = append(res.Runs, RunSummary{
-			RunID: r.ID, State: string(r.State), Label: r.Label, CommandLine: cl,
+			RunID: r.ID, State: string(r.State), Label: label, CommandLine: cl,
 			CreatedAt: ts(&r.CreatedAt), EndedAt: ts(r.EndedAt), ExitCode: r.ExitCode, Signal: r.Signal,
 			Termination: r.Termination, StoredBytes: r.Capture.StoredBytes, LostBytes: r.Capture.Lost(),
 		})
