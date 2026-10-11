@@ -577,6 +577,13 @@ func foreignSnapshot(rec Record, dir string) Snapshot {
 		}
 		rd.Close()
 	}
+	// Set Active=true if the run is still running; the owning instance will report
+	// actual lost_bytes and limit_reached. For finished runs, Active=false.
+	s.Capture.Active = rec.State == StateRunning
+	// Copy MaxBytes from the record if available
+	if rec.Capture != nil {
+		s.Capture.MaxBytes = rec.Capture.MaxBytes
+	}
 	s.Capture.Failure = fmt.Sprintf("capture stats are incomplete: this run is owned by instance %s (pid %d), not the querying instance; lost_bytes and limit_reached fields are unavailable", rec.Owner.Instance, rec.Owner.PID)
 	return s
 }
