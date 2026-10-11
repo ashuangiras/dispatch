@@ -668,7 +668,9 @@ func (s *Server) searchOutput(ctx context.Context, _ *mcp.CallToolRequest, in Se
 			cost += len(ol.Text) + lineOverhead
 			g.Lines = append(g.Lines, ol)
 		}
-		if len(res.Groups) > 0 && cost > budget {
+		// Check budget for all groups, including the first.
+		// If a group exceeds the budget, mark truncated and stop.
+		if cost > budget {
 			res.ResponseTruncated = true
 			res.ScanComplete = false
 			next = matches[i]
