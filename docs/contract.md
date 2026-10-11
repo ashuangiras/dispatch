@@ -109,3 +109,5 @@ Each is exercised against real subprocesses through a real MCP client (the Go SD
 | A15 | After a server crash, a running run is `interrupted` with its output readable; finished runs survive unchanged. | `TestRestartMarksInterruptedRuns`, `TestRepairIndexesTornState` |
 | A16 | Client disconnect shuts the server down, terminating run descendants, recorded as `server_shutdown`. | `TestShutdownTerminatesRuns` |
 | A17 | Explicit cleanup deletes finished runs only and rejects malformed IDs. | `TestDeleteRuns` |
+| A18 | A run owned by another live instance sharing the state directory is readable and waitable but not cancellable there. | `TestRunOwnedByAnotherLiveInstance` |
+| A19 | Automatic retention removes the oldest finished runs beyond the limit and never a running run. | `TestRetentionRemovesOldestFinishedRuns` |
