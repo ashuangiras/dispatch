@@ -565,7 +565,10 @@ func finishedSnapshot(rec Record, dir string) Snapshot {
 
 func foreignSnapshot(rec Record, dir string) Snapshot {
 	s := Snapshot{Record: rec, Dir: dir, OwnedElsewhere: true}
-	s.Capture.Active = true
+	// For foreign instances, we can read what's visible in capture files
+	// (bytes and lines) but cannot determine lost bytes or whether the limit was
+	// reached, as those are only tracked by the owning instance's Writer.
+	// Set Failure to explicitly mark that capture stats are incomplete.
 	if rd, err := capture.OpenReader(dir, true); err == nil {
 		if c, err := rd.Counts(); err == nil {
 			s.Capture.Bytes = c.Bytes
@@ -574,6 +577,7 @@ func foreignSnapshot(rec Record, dir string) Snapshot {
 		}
 		rd.Close()
 	}
+	s.Capture.Failure = fmt.Sprintf("capture stats are incomplete: this run is owned by instance %s (pid %d), not the querying instance; lost_bytes and limit_reached fields are unavailable", rec.Owner.Instance, rec.Owner.PID)
 	return s
 }
 
