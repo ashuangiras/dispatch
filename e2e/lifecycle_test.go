@@ -344,11 +344,11 @@ func TestEnvironmentPrecedenceAndSecrecy(t *testing.T) {
 		offset := int64(0)
 		for {
 			h.mustCall("read_output", map[string]any{
-				"run_id":   st.RunID,
-				"stream":   "stdout",
+				"run_id":      st.RunID,
+				"stream":      "stdout",
 				"byte_offset": offset,
-				"encoding": "base64",
-				"max_bytes": 65536,
+				"encoding":    "base64",
+				"max_bytes":   65536,
 			}, &rr)
 			if rr.Data != nil {
 				data, err := base64.StdEncoding.DecodeString(*rr.Data)
@@ -427,7 +427,7 @@ func TestLargeEnvironmentOutput(t *testing.T) {
 	// Regression test for large environments: verify that output exceeding default line limits
 	// can still be completely read and parsed by byte offset reads.
 	h := newHarness(t, "")
-	
+
 	// Create a large environment variable (> 4096 bytes) to test line truncation handling.
 	largeValue := strings.Repeat("x", 5000)
 	args := helperCommand("env")
@@ -439,7 +439,7 @@ func TestLargeEnvironmentOutput(t *testing.T) {
 	}
 	var st status
 	h.mustCall("run_command", with(args, "wait", true), &st)
-	
+
 	// Read environment using byte offset to get complete output despite line length.
 	// This replicates the envOf logic from TestEnvironmentPrecedenceAndSecrecy.
 	var rr readResult
@@ -467,12 +467,12 @@ func TestLargeEnvironmentOutput(t *testing.T) {
 			offset = *rr.NextByteOffset
 		}
 	}
-	
+
 	var kv []string
 	if err := json.Unmarshal(fullData, &kv); err != nil {
 		t.Fatalf("failed to parse environment JSON: %v (data len=%d)", err, len(fullData))
 	}
-	
+
 	// Verify the large environment value was preserved.
 	found := false
 	for _, e := range kv {
