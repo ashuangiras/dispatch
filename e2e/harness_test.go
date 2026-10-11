@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -172,6 +173,9 @@ func (h *harness) call(name string, args map[string]any, out any) string {
 		h.t.Fatalf("%s: %v", name, err)
 	}
 	if out != nil {
+		// Decode into a zero value: omitted fields must not keep a previous response's values.
+		v := reflect.ValueOf(out).Elem()
+		v.Set(reflect.Zero(v.Type()))
 		if err := json.Unmarshal(data, out); err != nil {
 			h.t.Fatalf("%s: decoding %s: %v", name, data, err)
 		}
