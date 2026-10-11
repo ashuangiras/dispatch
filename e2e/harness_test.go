@@ -32,7 +32,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	dispatchBin = filepath.Join(dir, "dispatch")
-	build := exec.Command("go", "build", "-o", dispatchBin, "../cmd/dispatch")
+	build := exec.Command("go", "build", "-race", "-o", dispatchBin, "../cmd/dispatch")
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "building dispatch:", err)
