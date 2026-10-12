@@ -120,6 +120,8 @@ type Manager struct {
 	closing  bool
 	wg       sync.WaitGroup
 	pruneMu  sync.Mutex
+	// openCapture permits deterministic storage-failure checks in package tests.
+	openCapture capture.OpenFunc
 }
 
 // New prepares the state directory, marks runs whose owner stopped as
@@ -223,6 +225,7 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 		if published {
 			return
 		}
+		r.closeCapture()
 		if r.lock != nil {
 			_ = r.lock.Close()
 		}
@@ -249,7 +252,7 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 	}
 
 	// Initialize capture.Writer before publishing.
-	if r.cw, err = capture.NewWriter(r.dir, maxOut, nil); err != nil {
+	if r.cw, err = capture.NewWriter(r.dir, maxOut, m.openCapture); err != nil {
 		return Snapshot{}, fmt.Errorf("dispatch could not prepare the run: %w", err)
 	}
 
@@ -260,8 +263,9 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 		return Snapshot{}, ErrShuttingDown
 	}
 	if len(m.active) >= m.cfg.MaxActive {
+		activeCount := len(m.active)
 		m.mu.Unlock()
-		return Snapshot{}, fmt.Errorf("%w: %d runs are active, the limit is %d; wait for or cancel one", ErrTooManyActive, len(m.active), m.cfg.MaxActive)
+		return Snapshot{}, fmt.Errorf("%w: %d runs are active, the limit is %d; wait for or cancel one", ErrTooManyActive, activeCount, m.cfg.MaxActive)
 	}
 	m.active[id] = r
 	m.wg.Add(1)
@@ -271,6 +275,7 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 	// Define abandon function for use after m.active publication.
 	abandon := func(err error) (Snapshot, error) {
 		close(r.started)
+		r.closeCapture()
 		_ = r.lock.Close()
 		_ = os.RemoveAll(r.dir)
 		m.mu.Lock()
@@ -298,6 +303,15 @@ func (m *Manager) Start(req StartRequest) (Snapshot, error) {
 		r.finish()
 	}
 	return r.snapshot(), nil
+}
+
+// closeCapture releases preparation resources when no child was launched.
+// CloseStream is idempotent and the second close releases the combined index.
+func (r *run) closeCapture() {
+	if r.cw != nil {
+		r.cw.CloseStream(capture.Stdout)
+		r.cw.CloseStream(capture.Stderr)
+	}
 }
 
 func (r *run) launch(req StartRequest) error {

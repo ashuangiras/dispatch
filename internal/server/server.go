@@ -720,6 +720,11 @@ func (s *Server) searchOutput(ctx context.Context, _ *mcp.CallToolRequest, in Se
 groups:
 	for i := 0; i < len(matches); {
 		lo := max(matches[i]-int64(ctxLines), last+1, 1)
+		if in.Cursor != "" {
+			// Context may overlap the preceding page. A continuation must
+			// not rewind into that overlap and spend its budget there again.
+			lo = max(lo, start)
+		}
 		hi := min(matches[i]+int64(ctxLines), total)
 		j := i + 1
 		for j < len(matches) && matches[j]-int64(ctxLines) <= hi+1 {

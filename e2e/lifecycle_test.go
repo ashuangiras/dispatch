@@ -294,10 +294,12 @@ func TestMaxActiveRuns(t *testing.T) {
 // a regression; a surviving, fully-accounted-for run set is the correctness
 // check black-box testing can add on top of that.
 func TestConcurrentStartAndList(t *testing.T) {
-	h := newHarness(t, "", "-max-active", "64")
 	const starters = 8
 	const startsPerWorker = 15
 	total := starters * startsPerWorker
+	// This checks concurrent publication, not admission rejection. Race-enabled
+	// helper processes may all remain alive until the final batch has started.
+	h := newHarness(t, "", "-max-active", strconv.Itoa(total))
 
 	var idsMu sync.Mutex
 	var ids []string
