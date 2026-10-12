@@ -94,6 +94,8 @@ func helper(args []string) int {
 			b[i] = byte(i)
 		}
 		_, _ = os.Stdout.Write(b)
+	case "longline": // needle beyond the search_output per-line scan limit
+		fmt.Println(strings.Repeat("x", (1<<20)+8) + "needle")
 	case "flood": // flood BYTES: write BYTES bytes of 'x' lines to stdout
 		line := []byte(strings.Repeat("x", 99) + "\n")
 		for left := n(1); left > 0; left -= len(line) {

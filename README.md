@@ -31,7 +31,7 @@ Flags: `-state-dir` (default `$DISPATCH_STATE_DIR`, `$XDG_STATE_HOME/dispatch` o
 A typical loop:
 
 1. `run_command {"command": "make", "args": ["test"], "cwd": "/repo", "wait": false}` → `run_id`
-2. `wait_for_run {"run_id": "...", "timeout_seconds": 120}` → state, exit code, last lines
+2. `wait_for_output` can wait for a readiness/log pattern before the command exits; `wait_for_run {"run_id": "...", "timeout_seconds": 120}` → state, exit code, last lines
 3. `search_output {"run_id": "...", "pattern": "FAIL", "context_lines": 5}`
 4. `read_output {"run_id": "...", "stream": "stderr", "start_line": -50}`
 

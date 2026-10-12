@@ -83,7 +83,7 @@ func argsPreview(args []string, limit int) ([]string, bool) {
 // Instructions is the server's guide for clients.
 const Instructions = `Dispatch runs commands asynchronously and keeps their complete output so you can inspect it precisely without rerunning them.
 
-Loop: run_command (wait=false to continue other work, or wait=true to block up to wait_timeout_seconds) returns a run_id and status with a short tail. Use wait_for_run or get_status later; neither returns the whole output. Read output with read_output (line ranges, negative start_line for the end, or the next_cursor from a previous read for incremental reads) and find things with search_output (literal or RE2 regex, with context lines). Every read is bounded: more_available says there is more, response_truncated says this response left something out, and output.lost_bytes / capture_error report output that was never stored. cancel_run stops a run and its process group. delete_runs removes finished runs; list_runs finds runs again.
+Loop: run_command (wait=false to continue other work, or wait=true to block up to wait_timeout_seconds) returns a run_id and status with a short tail. Use wait_for_output to wait for a log pattern, or wait_for_run or get_status later; neither returns the whole output. Read output with read_output (line ranges, negative start_line for the end, or the next_cursor from a previous read for incremental reads) and find things with search_output (literal or RE2 regex, with context lines). Every read is bounded: more_available says there is more, response_truncated says this response left something out, and output.lost_bytes / capture_error report output that was never stored. cancel_run stops a run and its process group. delete_runs removes finished runs; list_runs finds runs again.
 
 Commands are executed directly with an exact argument array, never through a shell; to use shell syntax, run a shell explicitly (e.g. command "sh", args ["-c", "..."]).`
 
@@ -103,6 +103,8 @@ func New(m *runs.Manager, version string) *mcp.Server {
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no}}, s.getStatus)
 	mcp.AddTool(srv, &mcp.Tool{Name: "wait_for_run", Description: waitDesc,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no}}, s.waitForRun)
+	mcp.AddTool(srv, &mcp.Tool{Name: "wait_for_output", Description: waitOutputDesc,
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no}}, s.waitForOutput)
 	mcp.AddTool(srv, &mcp.Tool{Name: "read_output", Description: readDesc,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: &no}}, s.readOutput)
 	mcp.AddTool(srv, &mcp.Tool{Name: "search_output", Description: searchDesc,
