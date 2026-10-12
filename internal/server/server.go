@@ -45,6 +45,41 @@ const (
 	defaultStatusTailLen = 0
 )
 
+// truncatePreview bounds s to at most limit bytes without splitting a UTF-8
+// sequence, and reports whether anything was cut off.
+func truncatePreview(s string, limit int) (string, bool) {
+	if len(s) <= limit {
+		return s, false
+	}
+	return strings.ToValidUTF8(s[:limit], "") + "…", true
+}
+
+// argsPreview bounds args to at most limit bytes total, keeping whole
+// arguments in order where they fit; an argument that does not fit whole is
+// itself cut to the remaining budget so the preview always shows something.
+// It never touches the real argv a command was started with, only a response
+// preview of it.
+func argsPreview(args []string, limit int) ([]string, bool) {
+	var out []string
+	used := 0
+	for i, a := range args {
+		remaining := limit - used
+		if remaining <= 0 {
+			return out, true
+		}
+		if len(a) > remaining {
+			s, _ := truncatePreview(a, remaining)
+			return append(out, s), true
+		}
+		out = append(out, a)
+		used += len(a)
+		if i == len(args)-1 {
+			return out, false
+		}
+	}
+	return out, false
+}
+
 // Instructions is the server's guide for clients.
 const Instructions = `Dispatch runs commands asynchronously and keeps their complete output so you can inspect it precisely without rerunning them.
 
@@ -198,11 +233,11 @@ func (s *Server) runCommand(ctx context.Context, _ *mcp.CallToolRequest, in RunC
 		}
 		wi = &WaitInfo{Finished: fin, DeadlineReached: !fin && ctx.Err() == nil, WaitedSeconds: time.Since(start).Seconds()}
 	}
-	return nil, s.status(snap, wi, tail), nil
+	return nil, s.status(snap, wi, tail, false), nil
 }
 
-func (s *Server) status(snap runs.Snapshot, wi *WaitInfo, tail int) RunStatus {
-	st := runStatus(snap)
+func (s *Server) status(snap runs.Snapshot, wi *WaitInfo, tail int, fullMetadata bool) RunStatus {
+	st := runStatus(snap, fullMetadata)
 	st.Wait = wi
 	if tail > 0 {
 		st.Tail = readTail(snap, tail)
@@ -266,8 +301,9 @@ func outLine(l capture.Line, v capture.View) OutLine {
 
 // RunIDInput selects a run.
 type RunIDInput struct {
-	RunID     string `json:"run_id"`
-	TailLines *int   `json:"tail_lines,omitempty" jsonschema:"last combined lines to include (default 0, max 100)"`
+	RunID        string `json:"run_id"`
+	TailLines    *int   `json:"tail_lines,omitempty" jsonschema:"last combined lines to include (default 0, max 100)"`
+	FullMetadata bool   `json:"full_metadata,omitempty" jsonschema:"return label and args whole, never cut to a preview (responses otherwise bound them); use only when you specifically need the complete value, not for routine polling"`
 }
 
 func (s *Server) getStatus(_ context.Context, _ *mcp.CallToolRequest, in RunIDInput) (*mcp.CallToolResult, RunStatus, error) {
@@ -279,7 +315,7 @@ func (s *Server) getStatus(_ context.Context, _ *mcp.CallToolRequest, in RunIDIn
 	if err != nil {
 		return nil, RunStatus{}, err
 	}
-	return nil, s.status(snap, nil, tail), nil
+	return nil, s.status(snap, nil, tail, in.FullMetadata), nil
 }
 
 // WaitInput is wait_for_run's input.
@@ -304,21 +340,30 @@ func (s *Server) waitForRun(ctx context.Context, _ *mcp.CallToolRequest, in Wait
 		return nil, RunStatus{}, err
 	}
 	wi := &WaitInfo{Finished: fin, DeadlineReached: !fin && ctx.Err() == nil, WaitedSeconds: time.Since(start).Seconds()}
-	return nil, s.status(snap, wi, tail), nil
+	return nil, s.status(snap, wi, tail, false), nil
 }
 
 // CaptureSummary repeats, in read and search results, whether output was lost.
 type CaptureSummary struct {
 	Active       bool   `json:"active" jsonschema:"output may still grow"`
-	Complete     bool   `json:"complete" jsonschema:"capture finished and nothing was lost"`
-	LostBytes    int64  `json:"lost_bytes" jsonschema:"bytes written by the command but never stored"`
-	LimitReached bool   `json:"limit_reached,omitempty"`
+	Complete     bool   `json:"complete" jsonschema:"capture finished and nothing was lost; false whenever stats_unknown is true"`
+	LostBytes    *int64 `json:"lost_bytes" jsonschema:"bytes written by the command but never stored; null when stats_unknown is true (not necessarily zero)"`
+	LimitReached *bool  `json:"limit_reached" jsonschema:"null when stats_unknown is true (not necessarily false)"`
+	StatsUnknown bool   `json:"stats_unknown,omitempty" jsonschema:"true when lost_bytes/limit_reached are not tracked here (the run is owned by another live Dispatch instance); distinct from error, which reports an actual capture failure"`
 	Error        string `json:"error,omitempty"`
 }
 
 func captureSummary(c capture.Stats) CaptureSummary {
-	return CaptureSummary{Active: c.Active, Complete: !c.Active && c.Lost() == 0 && c.Failure == "",
-		LostBytes: c.Lost(), LimitReached: c.LimitReached, Error: c.Failure}
+	cs := CaptureSummary{Active: c.Active, StatsUnknown: c.StatsUnknown, Error: c.Failure}
+	if c.StatsUnknown {
+		return cs
+	}
+	lost := c.Lost()
+	limitReached := c.LimitReached
+	cs.LostBytes = &lost
+	cs.LimitReached = &limitReached
+	cs.Complete = !c.Active && lost == 0 && c.Failure == ""
+	return cs
 }
 
 // ReadInput is read_output's input.
@@ -397,7 +442,11 @@ func (s *Server) readOutput(_ context.Context, _ *mcp.CallToolRequest, in ReadIn
 		if view == capture.ViewCombined {
 			return nil, ReadResult{}, errors.New("byte reads need stream stdout or stderr")
 		}
-		return nil, readBytes(rd, res, capture.Stream(view), *in.ByteOffset, maxBytes, in.Encoding), nil
+		res, err := readBytes(rd, res, capture.Stream(view), *in.ByteOffset, maxBytes, in.Encoding)
+		if err != nil {
+			return nil, ReadResult{}, err
+		}
+		return nil, res, nil
 	}
 	if in.Encoding != "" && in.Encoding != "text" {
 		return nil, ReadResult{}, errors.New("encoding applies to byte reads (byte_offset); line reads are text")
@@ -475,7 +524,16 @@ func (s *Server) readOutput(_ context.Context, _ *mcp.CallToolRequest, in ReadIn
 	return nil, res, nil
 }
 
-func readBytes(rd *capture.Reader, res ReadResult, s capture.Stream, off int64, maxBytes int, enc string) ReadResult {
+// readBytes reads exact bytes at a byte offset. Its contract is simple and
+// never silently switched: encoding "base64" always returns the exact bytes
+// requested, trivially making progress regardless of character boundaries.
+// encoding "text" (the default) always returns the requested encoding in
+// res.Encoding -- it never substitutes base64 -- and never splits a UTF-8
+// sequence across the end of the chunk; if max_bytes is too small to fit even
+// one complete character as text at this offset, it returns an actionable
+// error (bump max_bytes, or ask for encoding "base64") instead of a silent,
+// non-advancing empty read or an unrequested encoding change.
+func readBytes(rd *capture.Reader, res ReadResult, s capture.Stream, off int64, maxBytes int, enc string) (ReadResult, error) {
 	res.Stream = s.String()
 	if off < 0 {
 		off = 0
@@ -484,48 +542,48 @@ func readBytes(rd *capture.Reader, res ReadResult, s capture.Stream, off int64, 
 	if err != nil {
 		data = nil
 	}
-	switch enc {
-	case "base64":
+	if enc == "base64" {
 		str := base64.StdEncoding.EncodeToString(data)
 		res.Data = &str
-	default:
-		enc = "text"
-		originalLen := len(data)
+		res.Encoding = "base64"
+	} else {
+		res.Encoding = "text"
 		if off+int64(len(data)) < size {
-			// Do not split a UTF-8 sequence at the end of a chunk.
-			for i := 1; i <= 3 && i <= len(data); i++ {
-				if utf8.RuneStart(data[len(data)-i]) {
-					if !utf8.FullRune(data[len(data)-i:]) {
-						data = data[:len(data)-i]
+			// Do not split a UTF-8 sequence at the end of a chunk: trim back
+			// to the last complete rune.
+			trimmed := data
+			for i := 1; i <= 3 && i <= len(trimmed); i++ {
+				if utf8.RuneStart(trimmed[len(trimmed)-i]) {
+					if !utf8.FullRune(trimmed[len(trimmed)-i:]) {
+						trimmed = trimmed[:len(trimmed)-i]
 					}
 					break
 				}
 			}
-		}
-		// If we would return empty data due to UTF-8 truncation, fall back to base64
-		// to ensure progress. This prevents infinite loops when max_bytes is very small.
-		if len(data) == 0 && originalLen > 0 {
-			enc = "base64"
-			data, _, _ = rd.ReadBytes(s, off, maxBytes)
-			str := base64.StdEncoding.EncodeToString(data)
-			res.Data = &str
-		} else {
-			str := string(data)
-			if !utf8.Valid(data) {
-				str = strings.ToValidUTF8(str, "\uFFFD")
-				res.InvalidUTF8 = true
+			if len(trimmed) == 0 && len(data) > 0 {
+				// Not even one complete character fits as text in max_bytes at
+				// this offset. Paging again would repeat this exact failure
+				// forever, so fail loudly with what would fix it, rather than
+				// silently returning base64 (a different encoding than asked
+				// for) or an empty, non-advancing read.
+				return res, fmt.Errorf("max_bytes (%d) is too small to return a complete UTF-8 character as text at byte_offset %d; a character is at most 4 bytes, so increase max_bytes, or request encoding \"base64\" for exact bytes regardless of character boundaries", maxBytes, off)
 			}
-			res.Data = &str
+			data = trimmed
 		}
+		str := string(data)
+		if !utf8.Valid(data) {
+			str = strings.ToValidUTF8(str, "\uFFFD")
+			res.InvalidUTF8 = true
+		}
+		res.Data = &str
 	}
 	next := off + int64(len(data))
-	res.Encoding = enc
 	res.ByteOffset = &off
 	res.NextByteOffset = &next
 	res.TotalBytes = &size
 	res.MoreAvailable = next < size
 	res.ResponseTruncated = next < size
-	return res
+	return res, nil
 }
 
 // SearchInput is search_output's input.
@@ -545,7 +603,8 @@ type SearchInput struct {
 
 // MatchGroup is a run of consecutive lines holding one or more matches.
 type MatchGroup struct {
-	Lines []OutLine `json:"lines"`
+	Lines     []OutLine `json:"lines"`
+	Truncated bool      `json:"truncated,omitempty" jsonschema:"max_bytes cut this group short; its remaining lines and matches are not lost, they follow via next_cursor"`
 }
 
 // SearchResult is search_output's result.
@@ -656,6 +715,7 @@ func (s *Server) searchOutput(ctx context.Context, _ *mcp.CallToolRequest, in Se
 	}
 	budget := maxBytes
 	var last int64
+groups:
 	for i := 0; i < len(matches); {
 		lo := max(matches[i]-int64(ctxLines), last+1, 1)
 		hi := min(matches[i]+int64(ctxLines), total)
@@ -664,34 +724,72 @@ func (s *Server) searchOutput(ctx context.Context, _ *mcp.CallToolRequest, in Se
 			hi = min(matches[j]+int64(ctxLines), total)
 			j++
 		}
+		// Build the group's lines one at a time so an oversized group can be
+		// cut off cleanly instead of discarded whole: a group that does not
+		// fit the remaining budget still returns as much of it as fits,
+		// marked group.truncated, with next_cursor resuming right after the
+		// last line included. This guarantees forward progress on every
+		// call; nothing is silently skipped, only paged.
 		var g MatchGroup
-		var cost int
-		for n := lo; n <= hi; n++ {
+		groupMatches := 0
+		cost := 0
+		n := lo
+		for ; n <= hi; n++ {
 			l, err := rd.Line(view, n, maxLine)
 			if err != nil {
 				return nil, SearchResult{}, err
 			}
 			ol := outLine(l, view)
 			ol.Match = isMatch[n]
+			lineCost := len(ol.Text) + lineOverhead
+			if cost+lineCost > budget {
+				break
+			}
 			if ol.Truncated {
 				res.ResponseTruncated = true
 			}
-			cost += len(ol.Text) + lineOverhead
+			cost += lineCost
+			if ol.Match {
+				groupMatches++
+			}
 			g.Lines = append(g.Lines, ol)
 		}
-		// Check budget for all groups, including the first.
-		// If a group exceeds the budget, mark truncated and stop.
-		if cost > budget {
+		switch {
+		case len(g.Lines) == 0 && len(res.Groups) == 0:
+			// Not even one line of the very first group fits: paging again
+			// would just repeat this same failure forever. Fail loudly, with
+			// what the caller needs to make progress, instead of returning
+			// an empty, non-advancing page (the stall this is fixing).
+			need := lineOverhead
+			if l, lerr := rd.Line(view, lo, maxLine); lerr == nil {
+				need += len(outLine(l, view).Text)
+			}
+			return nil, SearchResult{}, fmt.Errorf("max_bytes (%d) is too small to return a match with context_lines=%d: one line alone needs about %d bytes here; increase max_bytes or lower context_lines", maxBytes, ctxLines, need)
+		case len(g.Lines) == 0:
+			// Budget ran out before this group could even start: stop
+			// cleanly before it, leaving it entirely for the next page.
+			next = matches[i]
 			res.ResponseTruncated = true
 			res.ScanComplete = false
-			next = matches[i]
-			break
+			break groups
+		case n <= hi:
+			// Partial group: include what fits, mark it explicitly, and
+			// resume exactly after the last line included, never repeating
+			// or dropping a line.
+			g.Truncated = true
+			res.Groups = append(res.Groups, g)
+			res.Matches += groupMatches
+			next = n
+			res.ResponseTruncated = true
+			res.ScanComplete = false
+			break groups
+		default:
+			res.Groups = append(res.Groups, g)
+			res.Matches += groupMatches
+			budget -= cost
+			last = hi
+			i = j
 		}
-		budget -= cost
-		res.Groups = append(res.Groups, g)
-		res.Matches += j - i
-		last = hi
-		i = j
 	}
 	res.NextCursor = cursorFor(view, next)
 	res.MoreAvailable = !res.ScanComplete
@@ -713,7 +811,7 @@ func (s *Server) cancelRun(_ context.Context, _ *mcp.CallToolRequest, in CancelI
 	if err != nil {
 		return nil, RunStatus{}, err
 	}
-	return nil, s.status(snap, nil, 0), nil
+	return nil, s.status(snap, nil, 0, false), nil
 }
 
 // ListInput is list_runs's input.
@@ -725,17 +823,19 @@ type ListInput struct {
 
 // RunSummary is one run in list_runs.
 type RunSummary struct {
-	RunID       string `json:"run_id"`
-	State       string `json:"state"`
-	Label       string `json:"label,omitempty"`
-	CommandLine string `json:"command_line" jsonschema:"command and args joined by spaces, cut to 200 bytes; for display only"`
-	CreatedAt   string `json:"created_at"`
-	EndedAt     string `json:"ended_at,omitempty"`
-	ExitCode    *int   `json:"exit_code,omitempty"`
-	Signal      string `json:"signal,omitempty"`
-	Termination string `json:"termination,omitempty"`
-	StoredBytes int64  `json:"stored_bytes"`
-	LostBytes   int64  `json:"lost_bytes,omitempty"`
+	RunID                string `json:"run_id"`
+	State                string `json:"state"`
+	Label                string `json:"label,omitempty"`
+	LabelTruncated       bool   `json:"label_truncated,omitempty" jsonschema:"label was cut to a preview; get_status with full_metadata returns it whole"`
+	CommandLine          string `json:"command_line" jsonschema:"command and args joined by spaces, cut to 200 bytes; for display only"`
+	CommandLineTruncated bool   `json:"command_line_truncated,omitempty" jsonschema:"command_line was cut; get_status with full_metadata returns the exact args"`
+	CreatedAt            string `json:"created_at"`
+	EndedAt              string `json:"ended_at,omitempty"`
+	ExitCode             *int   `json:"exit_code,omitempty"`
+	Signal               string `json:"signal,omitempty"`
+	Termination          string `json:"termination,omitempty"`
+	StoredBytes          int64  `json:"stored_bytes"`
+	LostBytes            *int64 `json:"lost_bytes,omitempty" jsonschema:"bytes never stored; absent when another live Dispatch instance owns this run and its loss stats are not tracked here (not necessarily zero)"`
 }
 
 // ListResult is list_runs's result.
@@ -768,19 +868,19 @@ func (s *Server) listRuns(_ context.Context, _ *mcp.CallToolRequest, in ListInpu
 	res := ListResult{Runs: []RunSummary{}, Total: len(all)}
 	for i := offset; i < len(all) && len(res.Runs) < limit; i++ {
 		r := all[i]
-		cl := strings.Join(append([]string{r.Command}, r.Args...), " ")
-		if len(cl) > argsPreviewBytes {
-			cl = strings.ToValidUTF8(cl[:argsPreviewBytes], "") + "…"
-		}
-		label := r.Label
-		if len(label) > labelPreviewBytes {
-			label = strings.ToValidUTF8(label[:labelPreviewBytes], "") + "…"
-		}
-		res.Runs = append(res.Runs, RunSummary{
-			RunID: r.ID, State: string(r.State), Label: label, CommandLine: cl,
+		cl, clTrunc := truncatePreview(strings.Join(append([]string{r.Command}, r.Args...), " "), argsPreviewBytes)
+		label, labelTrunc := truncatePreview(r.Label, labelPreviewBytes)
+		sum := RunSummary{
+			RunID: r.ID, State: string(r.State), Label: label, LabelTruncated: labelTrunc,
+			CommandLine: cl, CommandLineTruncated: clTrunc,
 			CreatedAt: ts(&r.CreatedAt), EndedAt: ts(r.EndedAt), ExitCode: r.ExitCode, Signal: r.Signal,
-			Termination: r.Termination, StoredBytes: r.Capture.StoredBytes, LostBytes: r.Capture.Lost(),
-		})
+			Termination: r.Termination, StoredBytes: r.Capture.StoredBytes,
+		}
+		if !r.Capture.StatsUnknown {
+			lost := r.Capture.Lost()
+			sum.LostBytes = &lost
+		}
+		res.Runs = append(res.Runs, sum)
 	}
 	if end := offset + len(res.Runs); end < len(all) {
 		res.NextCursor = strconv.Itoa(end)
