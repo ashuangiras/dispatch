@@ -124,7 +124,9 @@ wait (required): false returns at once with the run_id; true waits until the run
 
 The response is the run status plus the last tail_lines (default 10) combined output lines; it never contains the whole output.`
 
-const getStatusDesc = `Get a run's state: running, exited (exit_code or signal, and termination: exit, signal, timeout, cancelled or server_shutdown), failed_to_start (error) or interrupted (the Dispatch instance that owned it stopped first; outcome unknown). Includes timestamps and output counts per stream, lost bytes and capture errors. tail_lines (default 0, max 100) adds the last combined lines.`
+const getStatusDesc = `Get a run's state: running, exited (exit_code or signal, and termination: exit, signal, timeout, cancelled or server_shutdown), failed_to_start (error) or interrupted (the Dispatch instance that owned it stopped first; outcome unknown). Includes timestamps and output counts per stream, lost bytes and capture errors. tail_lines (default 0, max 100) adds the last combined lines.
+
+label and args are bounded to a preview (label_truncated / args_truncated say when); full_metadata true returns them whole instead — use it only when you need the complete value, not for routine polling. A run owned by another live Dispatch instance (owned_elsewhere) reports its lost_bytes/limit_reached as unknown (stats_unknown true, both null), not a fabricated zero/false.`
 
 const waitDesc = `Wait for a run to finish, up to timeout_seconds (default 30, max 300). If the deadline passes first, wait.deadline_reached is true and the command keeps running; call again to keep waiting. Cancelling this request ends the wait, never the run. Returns the status and the last tail_lines (default 10) combined lines.`
 
@@ -134,17 +136,17 @@ stream: stdout, stderr, or combined (default). Each stream keeps its exact byte 
 
 Position: start_line (1-based; negative counts from the end, -50 = last 50 lines), or cursor (the next_cursor of a previous read, for incremental reads that never skip or repeat a complete line). Bounds: max_lines (default 200, max 2000), max_bytes (default 32768, max 262144), max_line_bytes (default 4096): longer lines come back with truncated: true and byte_offset.
 
-Bytes: set byte_offset (with stream stdout or stderr) to read raw bytes from that offset, up to max_bytes; encoding text (UTF-8, invalid bytes replaced) or base64 (exact bytes).
+Bytes: set byte_offset (with stream stdout or stderr) to read raw bytes from that offset, up to max_bytes; encoding text (default, UTF-8) or base64 (exact bytes). The response's encoding always matches what was requested, never switched silently: base64 always returns exact bytes and makes progress regardless of character boundaries; text never splits a UTF-8 character across max_bytes, and if max_bytes cannot fit even one complete character at this offset, the call fails with an error telling you to raise max_bytes or use base64, instead of an empty, non-advancing read.
 
 more_available: more output exists past this response (continue with next_cursor). response_truncated: this response left something out because of its bounds. Neither means output was lost; output.lost_bytes and output.capture_error report output that was never stored.`
 
 const searchDesc = `Search a run's retained output for pattern: a literal string, or an RE2 regular expression when regex is true; ignore_case for case-insensitive matching. Searches complete lines of stream (default combined) from start_line or cursor, returning up to max_matches (default 20, max 200) matches, each with context_lines (default 2, max 20) lines around it; overlapping contexts are merged into one group.
 
-scan_complete true means every line up to scanned_through was searched; otherwise continue with next_cursor. next_cursor also resumes later on a running command to search only new lines. Only the first 1 MiB of a longer line is searched (long_lines_partially_searched counts them). Bounded by max_bytes like read_output.`
+scan_complete true means every line up to scanned_through was searched; otherwise continue with next_cursor. next_cursor also resumes later on a running command to search only new lines. Only the first 1 MiB of a longer line is searched (long_lines_partially_searched counts them). Bounded by max_bytes like read_output: a group too large for the remaining budget is returned partially (marked truncated in that group) with next_cursor resuming right after the last line included, never dropped or skipped. If not even one line of the first group fits max_bytes, the call fails with an error naming roughly how many bytes are needed; raise max_bytes or lower context_lines.`
 
 const cancelDesc = `Cancel a running command: Dispatch sends SIGTERM to its process group (the command and every descendant that stayed in its group), then SIGKILL after grace_seconds (default: the run's kill_grace_seconds) if the command has not exited, and waits briefly for the run to finish. Returns the status (termination cancelled). Cancelling a finished run changes nothing. Descendants that moved to their own process group or session are not tracked.`
 
-const listDesc = `List retained runs, newest first, with a short summary each. Optional state filter (running, exited, failed_to_start, interrupted). Paged: limit (default 20, max 100) and cursor (the next_cursor of the previous page).`
+const listDesc = `List retained runs, newest first, with a short summary each (label and command_line are bounded previews; label_truncated / command_line_truncated say when, and get_status with full_metadata returns either whole). Optional state filter (running, exited, failed_to_start, interrupted). Paged: limit (default 20, max 100) and cursor (the next_cursor of the previous page).`
 
 const deleteDesc = `Delete retained runs and their output. Give run_ids (up to 100), or all_finished true (optionally only those that ended more than older_than_seconds ago). Running runs are never deleted; they are reported in skipped. Dispatch also removes the oldest finished runs automatically beyond its retention limits (age, count and total bytes).`
 
