@@ -21,20 +21,23 @@ type outLine struct {
 }
 
 type streamStatus struct {
-	Bytes            int64 `json:"bytes"`
-	Lines            int64 `json:"lines"`
-	LostBytes        int64 `json:"lost_bytes"`
-	PartialLineBytes int64 `json:"partial_line_bytes"`
+	Bytes            int64  `json:"bytes"`
+	Lines            int64  `json:"lines"`
+	LostBytes        *int64 `json:"lost_bytes"`
+	PartialLineBytes int64  `json:"partial_line_bytes"`
 }
 
 type status struct {
-	RunID      string   `json:"run_id"`
-	State      string   `json:"state"`
-	Command    string   `json:"command"`
-	Executable string   `json:"executable"`
-	Args       []string `json:"args"`
-	Cwd        string   `json:"cwd"`
-	Env        struct {
+	RunID          string   `json:"run_id"`
+	State          string   `json:"state"`
+	Label          string   `json:"label"`
+	LabelTruncated bool     `json:"label_truncated"`
+	Command        string   `json:"command"`
+	Executable     string   `json:"executable"`
+	Args           []string `json:"args"`
+	ArgsTruncated  bool     `json:"args_truncated"`
+	Cwd            string   `json:"cwd"`
+	Env            struct {
 		Inherit bool     `json:"inherit"`
 		SetKeys []string `json:"set_keys"`
 		Unset   []string `json:"unset"`
@@ -55,7 +58,8 @@ type status struct {
 		Stderr        streamStatus `json:"stderr"`
 		CombinedLines int64        `json:"combined_lines"`
 		LimitBytes    int64        `json:"limit_bytes"`
-		LimitReached  bool         `json:"limit_reached"`
+		LimitReached  *bool        `json:"limit_reached"`
+		StatsUnknown  bool         `json:"stats_unknown"`
 		CaptureError  string       `json:"capture_error"`
 	} `json:"output"`
 	Wait *struct {
@@ -72,8 +76,9 @@ type status struct {
 type captureSummary struct {
 	Active       bool   `json:"active"`
 	Complete     bool   `json:"complete"`
-	LostBytes    int64  `json:"lost_bytes"`
-	LimitReached bool   `json:"limit_reached"`
+	LostBytes    *int64 `json:"lost_bytes"`
+	LimitReached *bool  `json:"limit_reached"`
+	StatsUnknown bool   `json:"stats_unknown"`
 	Error        string `json:"error"`
 }
 
@@ -101,6 +106,25 @@ func texts(lines []outLine) []string {
 		out[i] = l.Text
 	}
 	return out
+}
+
+// mustLostBytes and mustLimitReached unwrap a known lost_bytes/limit_reached
+// value, failing the test if it is unknown (nil) where the test expects an
+// authoritative answer (the run is not owned by another live instance).
+func mustLostBytes(t *testing.T, p *int64) int64 {
+	t.Helper()
+	if p == nil {
+		t.Fatal("lost_bytes is unknown (nil), want a known value")
+	}
+	return *p
+}
+
+func mustLimitReached(t *testing.T, p *bool) bool {
+	t.Helper()
+	if p == nil {
+		t.Fatal("limit_reached is unknown (nil), want a known value")
+	}
+	return *p
 }
 
 func TestRunWaitAndRead(t *testing.T) {

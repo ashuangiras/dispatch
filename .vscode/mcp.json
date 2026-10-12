@@ -3,6 +3,11 @@
     "polaroid": {
       "type": "http",
       "url": "http://127.0.0.1:7417/mcp"
+    },
+    "dispatch": {
+      "type": "stdio",
+      "command": "/Users/angirasa/.local/bin/dispatch",
+      "args": ["-state-dir", "/Users/angirasa/.local/state/dispatch"]
     }
   }
 }

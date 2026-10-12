@@ -83,6 +83,8 @@ func helper(args []string) int {
 	case "args": // args ...: print each argument as JSON
 		data, _ := json.Marshal(args[1:])
 		fmt.Println(string(data))
+	case "utf8": // utf8: write multi-byte UTF-8 characters, no trailing newline
+		fmt.Print("h\u00e9llo w\u00f6rld") // 'h', 2-byte 'é', "llo w", 2-byte 'ö', "rld"
 	case "env": // env: print the environment as a JSON list
 		data, _ := json.Marshal(os.Environ())
 		fmt.Println(string(data))

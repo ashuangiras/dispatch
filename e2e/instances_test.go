@@ -21,10 +21,19 @@ func TestRunOwnedByAnotherLiveInstance(t *testing.T) {
 	if seen.State != "running" || !seen.OwnedElsewhere || !seen.Output.CaptureActive {
 		t.Fatalf("status from other instance = %+v", seen)
 	}
+	// Cross-instance loss statistics are unknown, never asserted as zero/false:
+	// a querying instance that is not the owner cannot see the owning
+	// instance's in-memory lost_bytes/limit_reached counters.
+	if !seen.Output.StatsUnknown || seen.Output.Stdout.LostBytes != nil || seen.Output.LimitReached != nil || seen.Output.CaptureError != "" {
+		t.Fatalf("cross-instance output stats = %+v", seen.Output)
+	}
 	var rr readResult
 	b.mustCall("read_output", map[string]any{"run_id": st.RunID}, &rr)
 	if len(rr.Lines) != 1 || rr.Lines[0].Text != "owned-by-a" {
 		t.Fatalf("read from other instance = %+v", rr.Lines)
+	}
+	if !rr.Capture.StatsUnknown || rr.Capture.LostBytes != nil || rr.Capture.LimitReached != nil {
+		t.Fatalf("cross-instance read capture summary = %+v", rr.Capture)
 	}
 	if msg := b.call("cancel_run", map[string]any{"run_id": st.RunID}, nil); !strings.Contains(msg, "another live Dispatch instance") {
 		t.Fatalf("cancel from other instance = %q", msg)

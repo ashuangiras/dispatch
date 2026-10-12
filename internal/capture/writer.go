@@ -77,6 +77,15 @@ type Stats struct {
 	LostBytes    [2]int64 `json:"lost_bytes"`
 	LimitReached bool     `json:"limit_reached"`
 	Failure      string   `json:"failure,omitempty"`
+	// StatsUnknown is true when LostBytes and LimitReached are not tracked by
+	// whoever produced this Stats value (a foreign snapshot: a cross-instance
+	// reader can see bytes and lines actually stored, but loss accounting
+	// lives only in the owning instance's in-memory Writer). Callers must
+	// treat LostBytes/LimitReached as unknown, not as zero/false, whenever
+	// this is true. It is distinct from Failure: Failure means capture itself
+	// hit a real problem; StatsUnknown means these two fields specifically
+	// were never available to the reader that filled in this Stats value.
+	StatsUnknown bool `json:"stats_unknown,omitempty"`
 }
 
 // Lost is the total number of bytes the command wrote that were not stored.
