@@ -9,6 +9,7 @@ Dispatch is an MCP server (stdio) that runs commands asynchronously and keeps th
 | `run_command` | Start a command; optionally wait (bounded) for it. |
 | `get_status` | State, timestamps, exit/signal, output counts, capture loss. |
 | `wait_for_run` | Wait (bounded) for an existing run. |
+| `wait_for_output` | Wait for a matching complete output line without waiting for command completion. |
 | `read_output` | Bounded reads by line range, from the end, by cursor, or by byte offset. |
 | `search_output` | Literal or RE2 search with context, paged by cursor. |
 | `cancel_run` | Terminate a run's process group. |
@@ -48,6 +49,22 @@ Timestamps are RFC 3339 UTC: `created_at`, `started_at`, `ended_at`.
 - `wait_for_run` is the same bounded wait for an existing run.
 - Waiting never returns the whole output: responses carry status and at most `tail_lines` (max 100, each line cut to 1 KiB, 8 KiB total) of the combined view.
 - Cancelling an MCP request (or its client-side timeout) ends the wait, never the run.
+
+## Waiting for output
+
+`wait_for_output` takes a run ID, one literal pattern (or RE2 with `regex: true`), optional `ignore_case`, a stream, and an optional continuation cursor. Existing complete lines are checked first. Without a cursor it starts at line 1; supply the returned `next_cursor` to avoid scanning old output again. Partial lines remain pending until completed or the stream closes.
+
+`timeout_seconds` defaults to 30 and is at most 300. Zero checks current output once. Waiting and request cancellation never stop the command. The server checks for new complete lines at 100 ms intervals; this avoids client polling, but it is not a push-notification or real-time facility.
+
+Outcomes:
+
+- `match_found`: a matching line was observed. This does not establish application readiness or health. A positive match may coexist with incomplete capture; inspect the returned capture fields.
+- `deadline_reached`: no match was observed before this wait ended; the run can continue. If a scan hits its deadline, its incomplete progress is not committed to the cursor.
+- `run_ended`: no match in the fully searched, retained complete lines and the run is no longer running. Inspect `search.state`; this does not imply command success.
+- `capture_incomplete`: capture loss, a capture error, or unavailable foreign-instance statistics prevents trusting absence. Inspect retained bytes or query the owning instance.
+- `search_incomplete`: a line exceeds the existing 1 MiB search prefix limit. Inspect its remaining bytes before treating absence as meaningful.
+
+`search` contains the latest completed search (absent if the first scan exceeds the deadline), a bounded single matching-line excerpt, capture status, and line position. `max_bytes` and `max_line_bytes` use the same text-payload budgets as `search_output`. Use `read_output` for surrounding context or the full truncated line. Text and JSON encoding overhead are not part of that budget. Pattern validation, stream/cursor compatibility, and other errors are tool errors.
 
 ## Timeouts, cancellation, cleanup of descendants
 
@@ -119,3 +136,4 @@ Each is exercised against real subprocesses through a real MCP client (the Go SD
 | A22 | A match group too large for `max_bytes` pages as an explicit partial group with forward progress, or fails actionably if nothing fits at all. | `TestSearchOversizedGroupPagesWithoutStalling`, `TestSearchTinyBudgetReturnsActionableError` |
 | A23 | A byte read never answers in a different encoding than requested; text that cannot fit one complete UTF-8 character in `max_bytes` fails actionably instead. | `TestReadBytesUTF8Contract` |
 | A24 | `label` and `args` are bounded to a preview with explicit truncation flags in status and list responses; `full_metadata` returns them whole; the command always ran with the exact, untruncated args. | `TestMetadataBoundedWithFullMetadataOption` |
+| A25 | Live output waits match before exit, resume by cursor, distinguish end/deadline/loss/coverage, and cancellation leaves runs alone. | `TestWaitForOutputLiveMatchAndCursor`, `TestWaitForOutputDeadlineAndCancellationLeaveRunAlone`, `TestWaitForOutputExistingMatchEndAndStreams`, `TestWaitForOutputCaptureLossAndUnknown`, `TestWaitForOutputPartialLineAndSearchCoverage`, `TestWaitForOutputValidation` |
