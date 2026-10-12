@@ -20,7 +20,8 @@ import (
 type searchResult struct {
 	Stream string `json:"stream"`
 	Groups []struct {
-		Lines []outLine `json:"lines"`
+		Lines     []outLine `json:"lines"`
+		Truncated bool      `json:"truncated"`
 	} `json:"groups"`
 	Matches                    int            `json:"matches"`
 	ScannedFrom                int64          `json:"scanned_from"`
@@ -55,7 +56,7 @@ func TestHighVolumeOutput(t *testing.T) {
 	// A default read is bounded, says more is available, and is not mistaken for loss.
 	var rr readResult
 	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout"}, &rr)
-	if len(rr.Lines) != 200 || !rr.MoreAvailable || !rr.ResponseTruncated || rr.Capture.LostBytes != 0 || !rr.Capture.Complete {
+	if len(rr.Lines) != 200 || !rr.MoreAvailable || !rr.ResponseTruncated || mustLostBytes(t, rr.Capture.LostBytes) != 0 || !rr.Capture.Complete {
 		t.Fatalf("read = %d lines more=%v trunc=%v capture=%+v", len(rr.Lines), rr.MoreAvailable, rr.ResponseTruncated, rr.Capture)
 	}
 	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "start_line": 150000, "max_lines": 2000, "max_bytes": 1000}, &rr)
@@ -160,6 +161,81 @@ func TestSearchWithContextAndPaging(t *testing.T) {
 	}
 }
 
+// TestSearchOversizedGroupPagesWithoutStalling regression-tests the
+// independent review's finding that a run of adjacent matching lines larger
+// than max_bytes (200 adjacent matches with max_bytes=1000) produced zero
+// matches and a next_cursor that repeated forever. A merged group that does
+// not fit the budget must now return as much of itself as fits, marked
+// truncated, with next_cursor advancing past exactly what was returned: every
+// line is seen exactly once across pages, nothing skipped or repeated, and
+// the search reaches scan_complete in a bounded number of pages.
+func TestSearchOversizedGroupPagesWithoutStalling(t *testing.T) {
+	h := newHarness(t, "")
+	const n = 400
+	var st status
+	h.mustCall("run_command", with(helperCommand("lines", strconv.Itoa(n)), "wait", true), &st)
+
+	var sr searchResult
+	var collected []int64
+	totalMatches := 0
+	sawPartial := false
+	cursor := ""
+	for page := 0; ; page++ {
+		if page > 50 {
+			t.Fatalf("stalled: not scan_complete after %d pages (collected %d/%d lines)", page, len(collected), n)
+		}
+		args := map[string]any{"run_id": st.RunID, "pattern": "out ", "stream": "stdout", "context_lines": 0, "max_matches": 200, "max_bytes": 1000}
+		if cursor != "" {
+			args["cursor"] = cursor
+		}
+		h.mustCall("search_output", args, &sr)
+		if cursor != "" && sr.NextCursor == cursor {
+			t.Fatalf("next_cursor did not advance past %q: stalled", cursor)
+		}
+		for _, g := range sr.Groups {
+			if g.Truncated {
+				sawPartial = true
+			}
+			for _, l := range g.Lines {
+				collected = append(collected, l.N)
+			}
+		}
+		totalMatches += sr.Matches
+		cursor = sr.NextCursor
+		if sr.ScanComplete {
+			break
+		}
+	}
+	if !sawPartial {
+		t.Fatal("expected at least one page to mark a group truncated (budget cut it short)")
+	}
+	if totalMatches != n || len(collected) != n {
+		t.Fatalf("totalMatches=%d collected=%d, want %d both (a skipped or duplicated match/line)", totalMatches, len(collected), n)
+	}
+	for i, ln := range collected {
+		if ln != int64(i+1) {
+			t.Fatalf("collected[%d] = line %d, want %d: a line was skipped or duplicated across pages", i, ln, i+1)
+		}
+	}
+}
+
+// TestSearchTinyBudgetReturnsActionableError regression-tests that a budget
+// too small to return even one matching line (with its requested context)
+// fails loudly with guidance, instead of returning an empty, non-advancing
+// page that would stall forever under repeated pagination.
+func TestSearchTinyBudgetReturnsActionableError(t *testing.T) {
+	h := newHarness(t, "")
+	var st status
+	h.mustCall("run_command", with(helperCommand("lines", "5"), "wait", true), &st)
+	msg := h.call("search_output", map[string]any{"run_id": st.RunID, "pattern": "out", "max_bytes": 1}, nil)
+	if msg == "" {
+		t.Fatal("expected an error: max_bytes=1 cannot fit any line")
+	}
+	if !strings.Contains(msg, "max_bytes") || !strings.Contains(msg, "too small") {
+		t.Fatalf("error not actionable: %q", msg)
+	}
+}
+
 func TestConcurrentRuns(t *testing.T) {
 	h := newHarness(t, "")
 	const k = 12
@@ -207,6 +283,135 @@ func TestMaxActiveRuns(t *testing.T) {
 	h.mustCall("cancel_run", map[string]any{"run_id": a.RunID}, &a)
 	h.mustCall("run_command", with(helperCommand("exit", "0"), "wait", true), nil)
 	h.mustCall("cancel_run", map[string]any{"run_id": b.RunID}, nil)
+}
+
+// TestConcurrentStartAndList regression-tests the independent review's finding
+// that launch() wrote rec.Cwd and rec.Executable without the mutex snapshot()
+// reads under, and that terminate() could signal pgid 0 (this server's own
+// process group) for a run cancelled before its process existed. It hammers
+// run_command, list_runs, get_status and cancel_run concurrently so the race
+// detector (the server binary is built with -race, see TestMain) would catch
+// a regression; a surviving, fully-accounted-for run set is the correctness
+// check black-box testing can add on top of that.
+func TestConcurrentStartAndList(t *testing.T) {
+	h := newHarness(t, "", "-max-active", "64")
+	const starters = 8
+	const startsPerWorker = 15
+	total := starters * startsPerWorker
+
+	var idsMu sync.Mutex
+	var ids []string
+	stop := make(chan struct{})
+	var bg sync.WaitGroup
+
+	for i := 0; i < 4; i++ {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var lr struct {
+					Runs []struct {
+						RunID string `json:"run_id"`
+					} `json:"runs"`
+				}
+				h.mustCall("list_runs", map[string]any{"limit": 100}, &lr)
+				for _, r := range lr.Runs {
+					var st status
+					h.mustCall("get_status", map[string]any{"run_id": r.RunID}, &st)
+				}
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				idsMu.Lock()
+				var id string
+				if n := len(ids); n > 0 {
+					id = ids[n-1]
+				}
+				idsMu.Unlock()
+				if id != "" {
+					// May race Start() before its process group exists: this
+					// is exactly the window terminate() must not misfire in.
+					h.call("cancel_run", map[string]any{"run_id": id}, nil)
+				}
+			}
+		}()
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < starters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < startsPerWorker; j++ {
+				var st status
+				h.mustCall("run_command", with(helperCommand("exit", "0"), "wait", false), &st)
+				idsMu.Lock()
+				ids = append(ids, st.RunID)
+				idsMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	bg.Wait()
+
+	// A server crash or an unrecovered race/panic would already have broken
+	// the MCP connection and failed one of the h.mustCall calls above. Every
+	// started run must still be accounted for.
+	var lr struct {
+		Total int `json:"total"`
+	}
+	h.mustCall("list_runs", map[string]any{"limit": 1}, &lr)
+	if lr.Total != total {
+		t.Fatalf("total runs = %d, want %d", lr.Total, total)
+	}
+}
+
+// TestRejectedStartLeavesNoRunDirectory regression-tests the independent
+// review's finding that, with max-active=1, 20 rejected starts left 20
+// directories without a run.json: admission rejection must leave no run
+// directory, open capture handles, locks or active-count reservation behind.
+func TestRejectedStartLeavesNoRunDirectory(t *testing.T) {
+	h := newHarness(t, "", "-max-active", "1")
+	var blocker status
+	h.mustCall("run_command", with(helperCommand("sleep", "30"), "wait", false), &blocker)
+
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		msg := h.call("run_command", with(helperCommand("exit", "0"), "wait", false), nil)
+		if !strings.Contains(msg, "too many active runs") {
+			t.Fatalf("attempt %d: error = %q, want a too-many-active-runs rejection", i, msg)
+		}
+	}
+
+	entries, err := os.ReadDir(h.stateDir + "/runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != blocker.RunID {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("run directories after %d rejected starts = %v, want only the admitted blocker %s", attempts, names, blocker.RunID)
+	}
+
+	h.mustCall("cancel_run", map[string]any{"run_id": blocker.RunID}, nil)
 }
 
 func TestExecutionTimeoutKillsProcessGroup(t *testing.T) {
@@ -295,12 +500,12 @@ func TestCaptureLimitIsReported(t *testing.T) {
 		t.Fatalf("the command must finish normally when capture is limited: %+v", st)
 	}
 	o := st.Output
-	if !o.LimitReached || o.Stdout.Bytes != 65536 || o.Stdout.LostBytes != 1000000-65536 || o.Complete || o.LimitBytes != 65536 {
+	if !mustLimitReached(t, o.LimitReached) || o.Stdout.Bytes != 65536 || mustLostBytes(t, o.Stdout.LostBytes) != 1000000-65536 || o.Complete || o.LimitBytes != 65536 {
 		t.Fatalf("output = %+v", o)
 	}
 	var rr readResult
 	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "start_line": -1}, &rr)
-	if !rr.Capture.LimitReached || rr.Capture.LostBytes != 1000000-65536 || rr.Capture.Complete || !rr.Lines[0].Unterminated {
+	if !mustLimitReached(t, rr.Capture.LimitReached) || mustLostBytes(t, rr.Capture.LostBytes) != 1000000-65536 || rr.Capture.Complete || !rr.Lines[0].Unterminated {
 		t.Fatalf("read = %+v", rr)
 	}
 	if msg := h.call("run_command", with(helperCommand("exit", "0"), "wait", false, "max_output_bytes", int64(1)<<40), nil); !strings.Contains(msg, "max_output_bytes") {
@@ -330,6 +535,44 @@ func TestBinaryOutputAndByteReads(t *testing.T) {
 	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "byte_offset": 250, "max_bytes": 4}, &rr)
 	if *rr.NextByteOffset != 254 || !rr.MoreAvailable {
 		t.Fatalf("byte page = %+v", rr)
+	}
+}
+
+// TestReadBytesUTF8Contract regression-tests the UTF-8 byte-read contract:
+// encoding is never silently switched from what was requested. base64 always
+// returns exact bytes and always makes progress, regardless of character
+// boundaries. text never splits a UTF-8 character across max_bytes, and when
+// max_bytes is too small to fit even one complete character at the given
+// offset, the call fails with an actionable error instead of silently
+// becoming base64 (a previous, now-replaced fix) or returning an empty,
+// non-advancing read.
+func TestReadBytesUTF8Contract(t *testing.T) {
+	h := newHarness(t, "")
+	var st status
+	h.mustCall("run_command", with(helperCommand("utf8"), "wait", true), &st)
+	// "h\u00e9llo w\u00f6rld": 'h'(1) + 'é'(2 bytes at offset 1) + "llo w" + 'ö'(2 bytes) + "rld"
+
+	var rr readResult
+	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "byte_offset": 1, "max_bytes": 1, "encoding": "base64"}, &rr)
+	if rr.Encoding != "base64" || rr.Data == nil {
+		t.Fatalf("base64 read = %+v", rr)
+	}
+	data, err := base64.StdEncoding.DecodeString(*rr.Data)
+	if err != nil || len(data) != 1 || *rr.NextByteOffset != 2 {
+		t.Fatalf("base64 decode = %v data=%+v", err, rr)
+	}
+
+	msg := h.call("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "byte_offset": 1, "max_bytes": 1}, nil)
+	if msg == "" {
+		t.Fatal("expected an error reading 1 byte of text at the start of a 2-byte character")
+	}
+	if !strings.Contains(msg, "max_bytes") || !strings.Contains(msg, "base64") {
+		t.Fatalf("error not actionable: %q", msg)
+	}
+
+	h.mustCall("read_output", map[string]any{"run_id": st.RunID, "stream": "stdout", "byte_offset": 1, "max_bytes": 2}, &rr)
+	if rr.Encoding != "text" || rr.Data == nil || *rr.Data != "é" {
+		t.Fatalf("text read of exactly one character = %+v", rr)
 	}
 }
 
@@ -484,6 +727,47 @@ func TestLargeEnvironmentOutput(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("large environment variable not found or truncated; env vars: %v", kv)
+	}
+}
+
+// TestMetadataBoundedWithFullMetadataOption regression-tests that a large
+// label and large arguments no longer produce unbounded status/list
+// responses: they are bounded to a preview with an explicit *_truncated
+// flag, while get_status(full_metadata=true) returns them whole. The command
+// itself always runs with the exact, untruncated args regardless.
+func TestMetadataBoundedWithFullMetadataOption(t *testing.T) {
+	h := newHarness(t, "")
+	hugeLabel := strings.Repeat("L", 500)
+	hugeArg := strings.Repeat("A", 500)
+	var st status
+	h.mustCall("run_command", with(helperCommand("exit", "0", hugeArg), "wait", true, "label", hugeLabel), &st)
+
+	if !st.LabelTruncated || len(st.Label) >= len(hugeLabel) {
+		t.Fatalf("label not bounded: truncated=%v len=%d", st.LabelTruncated, len(st.Label))
+	}
+	if !st.ArgsTruncated {
+		t.Fatalf("args not marked truncated: %+v", st.Args)
+	}
+
+	var full status
+	h.mustCall("get_status", map[string]any{"run_id": st.RunID, "full_metadata": true}, &full)
+	if full.LabelTruncated || full.Label != hugeLabel {
+		t.Fatalf("full_metadata label = truncated=%v len=%d, want the whole %d-byte label", full.LabelTruncated, len(full.Label), len(hugeLabel))
+	}
+	if full.ArgsTruncated || len(full.Args) != 3 || full.Args[2] != hugeArg {
+		t.Fatalf("full_metadata args truncated=%v args=%q", full.ArgsTruncated, full.Args)
+	}
+
+	var lr struct {
+		Runs []struct {
+			RunID                string `json:"run_id"`
+			LabelTruncated       bool   `json:"label_truncated"`
+			CommandLineTruncated bool   `json:"command_line_truncated"`
+		} `json:"runs"`
+	}
+	h.mustCall("list_runs", map[string]any{"limit": 1}, &lr)
+	if len(lr.Runs) != 1 || !lr.Runs[0].LabelTruncated || !lr.Runs[0].CommandLineTruncated {
+		t.Fatalf("list_runs summary truncation flags = %+v", lr.Runs)
 	}
 }
 
